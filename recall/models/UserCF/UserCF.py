@@ -1,8 +1,8 @@
 """
 2022.5.14
-ItemCF model
+UserCF model
 N=10, K=10
-recall rate: 3.990%
+recall rate: 2.852%
 """
 import warnings
 import pandas as pd
@@ -58,33 +58,34 @@ class ItemCFRecall(nn.Module):
 
     def _build_MostSimN_index(self, N: int):
         """
-        建立每个物品到与其最相似的N个物品的索引
+        建立每个用户到与其最相似的N个用户的索引
         最耗时的一步
         """
-        movies_dis = [[] for movieId in range(self.nmovies + 1)]
-        sim = cosine_similarity(self.ui.T)
-        for i in tqdm(range(1, self.nmovies + 1)):
-            for j in range(i + 1, self.nmovies + 1):
-                if len(movies_dis[i]) < N:
-                    heapq.heappush(movies_dis[i], (sim[i, j], j))
-                elif movies_dis[i][0][0] < sim[i, j]:
-                    heapq.heapreplace(movies_dis[i], (sim[i, j], j))
+        users_sim = [[] for movieId in range(self.nusers + 1)]
+        sim = cosine_similarity(self.ui)
+        for i in range(1, self.nusers + 1):
+            for j in range(i + 1, self.nusers + 1):
+                if len(users_sim[i]) < N:
+                    heapq.heappush(users_sim[i], (sim[i, j], j))
+                elif users_sim[i][0][0] < sim[i, j]:
+                    heapq.heapreplace(users_sim[i], (sim[i, j], j))
 
-                if len(movies_dis[j]) < N:
-                    heapq.heappush(movies_dis[j], (sim[i, j], i))
-                elif movies_dis[j][0][0] < sim[i, j]:
-                    heapq.heapreplace(movies_dis[j], (sim[i, j], i))
+                if len(users_sim[j]) < N:
+                    heapq.heappush(users_sim[j], (sim[i, j], i))
+                elif users_sim[j][0][0] < sim[i, j]:
+                    heapq.heapreplace(users_sim[j], (sim[i, j], i))
 
-        self.SimN = movies_dis
+        self.SimN = users_sim
 
     def fit(self):
         rec_rating = [{} for userId in range(self.nusers + 1)]
         for userId in range(1, self.nusers + 1):
-            lastn = self.LastN[userId]
-            for movieId in lastn:
-                for sim, simMovieId in self.SimN[movieId]:
-                    rating = self.ui[userId][movieId] * sim
-                    rec_rating[userId][simMovieId] = rec_rating[userId].get(simMovieId, 0) + rating
+            mostSimUsers = self.SimN[userId]
+            for sim, simUser in mostSimUsers:
+                lastN = self.LastN[simUser]
+                for item in lastN:
+                    rating = sim * self.ui[simUser][item]
+                    rec_rating[userId][item] = rec_rating[userId].get(item, 0) + rating
 
         rec_list = [[] for userId in range(self.nusers + 1)]
         for userId in range(1, self.nusers + 1):
