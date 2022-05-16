@@ -11,7 +11,7 @@ import torch
 from torch import nn
 import torchhandle
 import numpy as np
-from recall import dataset
+from recall import utils
 from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 import heapq
@@ -114,7 +114,7 @@ class ItemCFRecall(nn.Module):
 
 
 if __name__ == '__main__':
-    train_df, test_df = dataset.split_latestN(N=10)
+    train_df, test_df = utils.split_latestN(N=10)
     userCF = ItemCFRecall(train_df, test_df)
     userCF.fit()
     userCF.test(K=10)
