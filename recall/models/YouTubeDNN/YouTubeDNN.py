@@ -1,13 +1,18 @@
 """
 Use NewsRec dataset.
-metrics are nearly 0.
-shit!
+Evaluate Epoch 4:
+NDCG ['NDCG@100: 0.0009']
+MRR ['MRR@100: 0.0065']
+Recall ['Recall@100: 0.0766']
+Hit ['Hit@100: 0.0766']
+Precision ['Precision@100: 0.0008']
 """
 import pandas as pd
 import torch
 from torch import nn, optim
 from torch import Tensor
 from torch.utils.data import DataLoader
+import torch.nn.functional as F
 import numpy as np
 from NewsDataset import NewsDataset
 from tqdm import tqdm
@@ -17,44 +22,51 @@ from collections import defaultdict
 
 class YouTubeDNN(nn.Module):
 
-    def __init__(self, item_num: int, user_num: int, city_num: int, province_num: int, embedding_dim: int = 16):
+    def __init__(self, item_num: int, user_num: int, city_num: int, province_num: int, device_num: int, OS_num: int,
+                 embedding_dim: int = 16):
         super(YouTubeDNN, self).__init__()
 
-        self.itemEmbedding = nn.Embedding(item_num + 1, embedding_dim, padding_idx=0)  # extra 1 for empty
+        self.itemEmbedding = nn.Embedding(item_num, embedding_dim, padding_idx=0)
         self.userEmbedding = nn.Embedding(user_num, embedding_dim)
         self.cityEmbedding = nn.Embedding(city_num, embedding_dim)
         self.provEmbedding = nn.Embedding(province_num, embedding_dim)
-        self.lin1 = nn.Linear(83, 128)
+        self.deviceEmbedding = nn.Embedding(device_num, embedding_dim)
+        self.OSEmbedding = nn.Embedding(OS_num, embedding_dim)
+        self.lin1 = nn.Linear(92, 128)
         self.lin2 = nn.Linear(128, 32)
         self.lin3 = nn.Linear(32, 16)
 
-    def forward(self, disc: Tensor, cont: Tensor, itemId: Tensor):
-        userEmbedding = self.user_tower(disc, cont)  # (bs, emb dim)
+    def forward(self, disc: Tensor, cont: Tensor, history: Tensor, items: Tensor):
+        userEmbedding = self.user_tower(disc, cont, history).unsqueeze(dim=1)  # (bs, 1, emb dim)
 
-        itemEmbedding = self.itemEmbedding(itemId)  # (bs, emb dim)
-        logits = (userEmbedding * itemEmbedding).sum(dim=1)  # (bs)
-        scores = torch.sigmoid(logits)
+        itemEmbedding = self.itemEmbedding(items)  # (bs, 1 + neg_num, emb dim)
+        logits = F.cosine_similarity(userEmbedding, itemEmbedding, dim=2)  # (bs)
+        scores = torch.softmax(logits, dim=-1)
         return scores
 
-    def user_tower(self, disc: Tensor, cont: Tensor) -> Tensor:
+    def user_tower(self, disc: Tensor, cont: Tensor, history: Tensor) -> Tensor:
         """
         concatenate features and go through MLP
-        :param disc: userId province city hist(10)
+        :param history:
+        :param disc:
         :param cont:
         :return:
         """
         # disc:
         userId = disc[:, 0]
-        province = disc[:, 1]
-        city = disc[:, 2]
-        hist = disc[:, 3:]
+        device = disc[:, 1]
+        OS = disc[:, 2]
+        province = disc[:, 3]
+        city = disc[:, 4]
 
         userId_embedding = self.userEmbedding(userId)
+        device_embedding = self.deviceEmbedding(device)
+        OS_embedding = self.OSEmbedding(OS)
         prov_embedding = self.provEmbedding(province)
         city_embedding = self.cityEmbedding(city)
-        hist_embedding = self.itemEmbedding(hist).mean(dim=1)  # kick out empty hist
+        hist_embedding = self.itemEmbedding(history).mean(dim=1)
 
-        userEmbedding = torch.cat([userId_embedding, prov_embedding, city_embedding, hist_embedding, cont], dim=1).float()  # (bs, 83)
+        userEmbedding = torch.cat([userId_embedding, prov_embedding, city_embedding, hist_embedding, cont], dim=1).float()  # (bs, 92)
         userEmbedding = self.lin1(userEmbedding)
         userEmbedding = self.lin2(userEmbedding)
         userEmbedding = self.lin3(userEmbedding)  # (bs, emb dim)
@@ -173,62 +185,63 @@ def topk_metrics(y_true, y_pred, topKs=[5]):
     return results
 
 
-def trainer(trainDf: pd.DataFrame, evalDf: pd.DataFrame, epochs=100):
-    item_num = 218364
-    user_num = trainDf.userId.max() + 1
-    province_num = trainDf.province.max() + 1
-    city_num = trainDf.city.max() + 1
-
+def trainer(trainDf: pd.DataFrame, evalDf: pd.DataFrame, epochs=100, batch_size=64, alpha=0.1):
+    item_num = 306661 + 1
+    user_num = 919603 + 1
+    province_num = 274 + 1
+    city_num = 683 + 1
+    device_num = 2826 + 1
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     trnDs = NewsDataset(trainDf)
     evalDs = NewsDataset(evalDf)
-    trnDl = DataLoader(trnDs, batch_size=64, shuffle=True)
-    evalDl = DataLoader(evalDs, batch_size=64)
-    model = YouTubeDNN(item_num=item_num, user_num=user_num, province_num=province_num, city_num=city_num).to(device)
-    criterion = nn.BCELoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    trnDl = DataLoader(trnDs, batch_size=batch_size, shuffle=True, drop_last=True)
+    evalDl = DataLoader(evalDs, batch_size=batch_size, shuffle=True, drop_last=True)
+    model = YouTubeDNN(item_num=item_num, user_num=user_num, province_num=province_num, city_num=city_num,
+                       device_num=device_num, OS_num=3).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=5e-4)
 
     for epoch in range(epochs):
         model.train()
         trn_loss = torch.tensor(0.).to('cuda')
-        for disc, cont, itemId, click in tqdm(trnDl, desc=f'Train Epoch {epoch}'):
+        for disc, cont, history, items in tqdm(trnDl, desc=f'Train Epoch {epoch}'):
             # print(disc.shape, cont.shape, itemId.shape, click.shape)
-            disc, cont, itemId, click = disc.to(device), cont.to(device), itemId.to(device), click.to(device)
-            pred = model(disc, cont, itemId)
-            bloss = criterion(pred, click)
+            disc, cont, history, items = disc.to(device), cont.to(device), history.to(device), items.to(device)
+            y = torch.zeros(batch_size, device='cuda').long()
+            pred = model(disc, cont, history, items)
+            bloss = criterion(pred, y) + sum([(w ** 2).sum() ** 0.5 for w in model.parameters() if len(w.shape) == 2 and w.shape[1] == 16]) / 10240
             optimizer.zero_grad()
             bloss.backward()
             optimizer.step()
             trn_loss += bloss * disc.shape[0]
 
-        print(f'Loss = {trn_loss.detach().cpu().item()}')
+        print(f'Loss = {trn_loss.detach().cpu().item():.3f}')
 
         model.eval()
         annoy = Annoy(n_trees=10)
-        itemEmbedding = model.itemEmbedding.weight
+        itemEmbedding = model.itemEmbedding.weight.detach().cpu().numpy()
         annoy.fit(itemEmbedding)
-        topk = 10
+        topk = 100
         match_res = {}
         ground_truth = {}
         with torch.no_grad():
-            for disc, cont, itemId, click in tqdm(evalDl, desc=f'Evaluate Epoch {epoch}'):
-                disc, cont, itemId, click = disc.to(device), cont.to(device), itemId.tolist(), click.to(device)
-                userEmbedding = model.user_tower(disc, cont)
+            for disc, cont, history, items in tqdm(evalDl, desc=f'Evaluate Epoch {epoch}'):
+                disc, cont, history, items = disc.to(device), cont.to(device), history.to(device), items.to(device)
+                userEmbedding = model.user_tower(disc, cont, history)
                 userIds = disc[:, 0].tolist()
-                for idx in range(len(userIds)):
+                for idx, userId in enumerate(userIds):
                     items_idx, items_scores = annoy.query(v=userEmbedding[idx], n=topk)
-                    userId = userIds[idx]
-                    true_itemId = itemId[idx]
+                    true_itemId = items[idx, 0].detach().cpu().item()
                     match_res[userId] = items_idx
                     ground_truth[userId] = [true_itemId]
-        report = topk_metrics(ground_truth, match_res, topKs=[5, 10])
+        report = topk_metrics(ground_truth, match_res, topKs=[topk])
         for key in report:
             print(key, report[key])
 
 
 if __name__ == '__main__':
-    trainDf = pd.read_csv(f'~/Rec/data/NewsRec/train_df.csv', index_col=0)
-    evalDf = pd.read_csv(f'~/Rec/data/NewsRec/eval_df.csv', index_col=0)
+    train_df = pd.read_pickle(f'~/data/train.pkl')#.sample(frac=0.3, random_state=2022)
+    eval_df = pd.read_pickle(f'~/data/test.pkl')
     print('read finish.')
-    trainer(trainDf, evalDf)
+    trainer(train_df, eval_df, batch_size=8192)
 
